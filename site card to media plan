@@ -1,0 +1,49 @@
+site-card deck → Media Plan Excel
+Why this one is mostly deterministic
+
+Unlike the vendor-proposal step, the input here is a deck already built from billups site template.pptx (or, better, the sites.json that produced it) — so the layout is fixed and known. That means this skill can safely use a template-filling script rather than a read-and-interpret pass. The one thing that still needs judgment is the campaign-level information (client name, campaign dates, buying currency, plan version, billups campaign number, vendor name if not per-site) — none of that lives on a site card, so it has to come from the user.
+
+Workflow
+1. Get the per-site data
+
+Prefer, in this order:
+
+sites.json left behind by vendor-proposal-to-billups-deck (or handed to you directly) — it has clean numeric fields (price_amount, gps_lat/gps_lng if present) rather than display strings, so it's the highest-fidelity source.
+The deck itself, if sites.json isn't available:
+bash
+   python3 scripts/parse_deck.py <deck.pptx> sites.json
+
+This matches on the labelled text itself (Address:, GPS Coordinates:, Price (...) : ..., etc.), not on shape names or placeholder positions — so it works whether the deck came from vendor-proposal-to-billups-deck (whose shapes are named "TextBox 6/9/12/17", nested inside group shapes) or was hand-built/duplicated by a person in PowerPoint or Google Slides (whose shapes are named something else entirely, e.g. "Google Shape;428;p29" on a Google Slides export — matching by name would silently return an all-null site list on a deck like that). Slides without both a labelled specs block and a price line (covers, section dividers, closing slides) are recognized as non-site-card slides and skipped rather than emitted as blank rows — the script reports how many it skipped. It recovers everything build_deck.py originally wrote except photo_image/map_image paths (the images themselves aren't needed for the Excel) and whatever wasn't on the card in the first place (e.g. site_name alone, if the card only shows road_location).
+
+Check the site count and a couple of full records after running this — real-world decks are messier than the ones this was first built against. Two things worth a second look: (a) some fields occasionally go missing on a card (e.g. "Spot / Day:" left blank) — that's the deck's own data gap, not a parsing bug, so leave it blank rather than guessing a value; (b) a deck can present multiple overlapping site groupings on purpose — e.g. two alternative "Package Option" proposals sharing some sites — in which case ask the user which grouping(s) should become the media plan rather than dumping every site from every slide into one plan (see the judgment call below).
+
+2. Get the campaign-level fields
+
+Read references/field_mapping.md for the full list of what build_xlsx.py expects in campaign.json and what each field feeds. At minimum, ask the user (don't guess) for: client name, campaign name, start date, end date, and buying/client currency — these appear in both sheets' headers and drive the duration/date formulas. Everything else in campaign.json is optional; omitted fields are simply left blank in the sheet for the user to fill in by hand. If the user already stated some of these earlier in the conversation (e.g. while building the deck), reuse them instead of re-asking.
+
+Two judgment calls worth flagging to the user, never guessing silently:
+
+Vendor rate cards often have multiple durations/dayparts per site, but each sites.json record carries one representative price. If a site's cheapest slot and its "headline" rate differ, confirm which one belongs in the media plan before running the build.
+If the deck presents more than one site grouping for the same pitch (e.g. "Package Option 1" vs "Package Option 2" section dividers, possibly sharing some sites between them), ask which grouping(s) the media plan should cover — one plan per option is usually right, since a single combined plan would double-count any site that appears in both options and doesn't represent a real, buyable media plan.
+3. Build the Excel
+bash
+python3 scripts/build_xlsx.py sites.json campaign.json assets/templates/Media_Plan_Template_billups_v3.xlsx output.xlsx
+
+The bundled template is the reduced, client-facing Media Plan layout — the one billups actually shares with clients (Media Plan Template billups.xlsx), NOT the full internal spreadsheet the billups app itself exports. The internal app export carries a much richer breakdown (Gross, Margin, Install, Upload, Production, a Local+Client column pair for every cost line, a daily flighting calendar) that has no place in front of a client, so this script deliberately keeps only one column per cost line — Media Rate Card, Media Net, Media Cost, Advertising Taxes, Internal Production — plus a single TOTAL COST (Local) column. The script fills one row per site starting at row 21 (inserting extra rows above the TOTALS row, copying row 21's formatting, if there are more than 8 sites — the template ships with 8 pre-formatted rows, 21-28), writes VAT into Advertising Taxes as =Media Cost*vat_rate (11% by default — see field_mapping.md), computes TOTAL COST (Local) as =Media Cost+Advertising Taxes+Internal Production, and fills the SUMMARY sheet's campaign header plus one market rollup row (row 17; row 16 holds the headers) that cross-references the Country sheet's totals. Unlike the internal app export, there's no Local/Client column pair on every cost line — the one Local→Client currency conversion for the whole market happens once, at SUMMARY!M17, using the market sheet's own Exchange Rate cell (C14). The script also overrides the template's pre-baked CHF/EUR-symbol accounting format with a plain #,##0 format on every cost cell it writes — since billups media plans get built in whatever currency the market actually buys in (IDR, PHP, USD, etc.), a foreign currency symbol surviving onto the wrong-currency plan is a common tell that this step was skipped.
+
+4. QA before handing it back
+
+Formulas don't evaluate inside openpyxl — you have to actually recalculate to catch a bad formula string. build_xlsx.py sets fullCalcOnLoad so Excel recalculates the instant a person opens the file, but that flag doesn't help this QA step (or a non-Excel viewer) — convert to PDF (which forces LibreOffice to recalculate) and read the result:
+
+bash
+soffice --headless --convert-to pdf output.xlsx
+pdftotext -layout output.pdf -
+
+Check: the SUMMARY sheet's totals (K17 Duration, L17/M17 TOTAL COST Local/Client, H17/H18 Campaign Audience Delivery/plan-level TOTALS) match the Country sheet's totals row; the per-row AL (TOTAL COST) and AJ (Advertising Taxes / VAT) values are non-blank, formatted with thousands separators, and not showing a foreign currency symbol; the AF per-row Duration formulas produced a sane number of days for the campaign's date range (the totals-row AF cell is deliberately left blank — see field_mapping.md for why summing per-row durations would be wrong); and AB (Impacts) equals AA (Reach, the Media Owner's daily impressions figure) times that row's AF — if AB doesn't equal AA × AF for every row, the formula didn't get written correctly. Also spot-check one row's AI/AL against the site's price as it reads on the card, by hand — price_amount and spectator_per_day are display strings, and a deck using a different number format than expected (comma-decimal/dot-thousands "360.000.000,-" instead of dot-decimal/comma-thousands "360,000,000") is a real, silent failure mode: it doesn't error, it just produces a cost or reach figure ~1000x too small. Site data (city, GPS, price) is often the basis for real client billing — don't let a copy/formula error, or a misread number format, slip through uncaught. Also check the three hardcoded/derived columns: W (Buying Method) always reads "Direct"; AE (Cycle Type) always reads "1 month" regardless of what duration the vendor quoted; and Z (SOT) reads 100.0% for every Static row (column Q) and 1/client_sharing for every Digital row (e.g. 8-way sharing -> 12.5%) — a Digital row showing a blank Z means parse_deck.py didn't recover a "Client Sharing: N clients" line for that site, which is a real gap on the card, not a bug, but worth flagging to the user rather than silently leaving SOT blank on a real plan.
+
+Reference
+references/field_mapping.md — full sites.json/campaign.json field → Country Template sheet and SUMMARY sheet mapping, verified against the actual client-facing template.
+scripts/parse_deck.py — recovers sites.json from a deck when the JSON itself isn't available. Usage: python3 parse_deck.py <deck.pptx> [output.json].
+scripts/build_xlsx.py — the template-filling script. Usage: python3 build_xlsx.py <sites.json> <campaign.json> <template.xlsx> <output.xlsx>. Expects the template to keep the exact sheet/column layout of assets/templates/Media_Plan_Template_billups_v3.xlsx (one market sheet with data starting row 21 across 8 pre-formatted rows, columns B–AP per references/field_mapping.md; SUMMARY header C3:C11, header row 16, rollup row 17) — if the user supplies a different Media Plan template variant, open it and confirm the layout still matches before assuming the script will work unmodified. If the user instead wants the full internal billups-app format (e.g. for uploading back into the app rather than sharing with a client), that's a different column layout entirely — check with them before reusing this script's output for that purpose.
+The xlsx skill has broader spreadsheet-editing mechanics if the user wants something this script doesn't cover (e.g. a second market added to an existing plan, or a chart built on top of the totals).
+vendor-proposal-to-billups-deck is the upstream skill that produces the deck (and, ideally, the sites.json) this skill consumes.
